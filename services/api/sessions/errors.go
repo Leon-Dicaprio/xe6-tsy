@@ -24,9 +24,20 @@ const (
 )
 
 var (
+	ErrInvalidRequest         = errors.New(string(CodeInvalidRequest))
+	ErrUnauthorized           = errors.New(string(CodeUnauthorized))
 	ErrVoiceSessionNotFound   = errors.New(string(CodeVoiceSessionNotFound))
 	ErrEndIntentNotFound      = errors.New(string(CodeEndIntentNotFound))
-	ErrConcurrentTransition   = errors.New(string(CodeSessionStateConflict))
+	ErrSessionStateConflict   = errors.New(string(CodeSessionStateConflict))
+	ErrConcurrentTransition   = ErrSessionStateConflict
 	ErrIdempotencyKeyConflict = errors.New(string(CodeIdempotencyKeyConflict))
+	ErrLanguageConfigNotReady = errors.New(string(CodeLanguageConfigNotReady))
+	ErrWebRTCNotReady         = errors.New(string(CodeWebRTCNotReady))
+	ErrRealtimeAlreadyRunning = errors.New(string(CodeRealtimeAlreadyRunning))
+	ErrUnsupportedAudio       = errors.New(string(CodeUnsupportedAudio))
+	ErrRealtimeStartFailed    = errors.New(string(CodeRealtimeStartFailed))
+	ErrRealtimeStopFailed     = errors.New(string(CodeRealtimeStopFailed))
+	ErrRuntimeUnavailable     = errors.New(string(CodeRuntimeUnavailable))
+	ErrWebRTCUnavailable      = errors.New(string(CodeWebRTCUnavailable))
 	ErrNotImplemented         = errors.New(string(CodeNotImplemented))
 )
