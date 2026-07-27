@@ -104,6 +104,29 @@ resources were cleaned up.
 - List returns `VoiceSessionListItem` values from persistent storage only.
 - List never calls realtime per row or in batch and never filters by runtime or
   connection state.
+- `Service.GetSession` is the trusted internal `SessionReader` implementation
+  and uses `Repository.Get`; authenticated user flows always use
+  `Repository.GetOwned`.
+
+## Service orchestration
+
+`NewService` requires the repository, language-config reader, WebRTC connection
+reader, realtime lifecycle, ID generator, and clock. It does not initialize
+databases, HTTP servers, or provider adapters.
+
+Lifecycle operations for one session are serialized in process. Repository
+conditional transitions remain the cross-process consistency boundary, and no
+database transaction is held while realtime or WebRTC dependencies are called.
+
+Start compensation ignores request cancellation but has a bounded timeout. If
+realtime starts and `TransitionToActive` fails, the service calls idempotent
+`Stop`, verifies a `stopped` snapshot, logs the request and session IDs, and
+leaves the persistent session `created`.
+
+End always saves `EndIntent` before cleanup. Stop errors, timeouts, an
+unconfirmed `stopped` snapshot, or transition failures leave the intent
+incomplete. Replaying the same request or calling `ResumeEnd` retries cleanup
+and the conditional terminal transition.
 
 ## Idempotency ownership
 
@@ -115,9 +138,9 @@ resources were cleaned up.
 
 ## Current slice
 
-This foundation defines domain models, errors, and ports only. Service
-orchestration, HTTP handlers, route registration, OpenAPI, repositories, and
-production adapters belong to follow-up reviewable slices. No stub in this
-package returns fabricated success data. It does not change `main.go`,
+This package now includes the domain foundation and independently testable
+Service orchestration. HTTP handlers, route registration, OpenAPI,
+repositories, and production adapters remain follow-up reviewable slices. No
+stub returns fabricated success data. This slice does not change `main.go`,
 `go.work`, shared authentication, shared error responses, or request-ID
 middleware.
