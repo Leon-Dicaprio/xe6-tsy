@@ -95,6 +95,9 @@ func (i EndIntent) Completed() bool {
 // read or mutation, and Expected changes return ErrConcurrentTransition.
 type Repository interface {
 	Create(ctx context.Context, params CreateParams) (session VoiceSession, replayed bool, err error)
+	// Get is reserved for trusted module-to-module reads. External user flows
+	// must use GetOwned so account existence cannot be inferred.
+	Get(ctx context.Context, sessionID string) (VoiceSession, error)
 	GetOwned(ctx context.Context, accountID string, sessionID string) (VoiceSession, error)
 	List(ctx context.Context, filter ListFilter) (ListPage, error)
 	SaveEndIntent(ctx context.Context, intent EndIntent) (saved EndIntent, replayed bool, err error)
