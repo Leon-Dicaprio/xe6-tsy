@@ -193,6 +193,11 @@ serialize operations for session_id
 ```
 
 A `created` session skips realtime Stop and transitions directly to `ended`.
+That shortcut is safe only because `SaveEndIntent` and
+`BeginStartOperation` form an atomic repository interlock: an unresolved Start
+operation blocks End intent creation, and an incomplete End intent blocks a new
+Start operation.
+
 For an `active` session, Stop failure, timeout, or unconfirmed cleanup leaves
 the business status `active`, leaves `ended_at` unset, and preserves the
 incomplete intent. A repeated request reads the intent:
@@ -207,6 +212,25 @@ If Stop succeeds but the database transition fails, a retry invokes the
 idempotent Stop again and retries the transition. An unrecoverable runtime
 failure may use `TransitionToFailed` only after realtime confirms all owned
 resources were cleaned up.
+
+`EndIntent` is the durable cross-instance request identity, not an exclusive
+execution lease. Multiple instances replaying the same key and hash may call
+the idempotent realtime Stop. `TransitionToEnded` is the repository-owned
+compare-and-swap boundary; a loser rereads the immutable terminal session and
+completes the same intent. Different sessions remain independent.
+
+Only a valid `stopped` snapshot for the requested Session ID confirms cleanup.
+`starting`, `stopping`, `failed`, missing timestamps, and dependency timeouts
+all preserve the prior business status and incomplete intent. A terminal
+transition and EndIntent completion each use a fresh bounded context that
+retains request values without inheriting request cancellation. This lets a
+confirmed Stop reach durable state even when the client disconnects.
+
+An already `ended` or `failed` session remains immutable. A matching replay
+returns that stored terminal result and idempotently completes an unfinished
+intent; End never converts `failed` to `ended`. This is also the terminal
+decision rule for the future End-versus-Runtime-Failure race: the first
+repository terminal transition wins.
 
 ## Query flows
 
@@ -243,12 +267,13 @@ clients.
 ## Current slice
 
 The service currently implements Create, account-scoped Detail, State, and
-List queries, plus durable idempotent Start orchestration with repository-owned
-bounded compensation and interrupted-owner recovery.
+List queries, durable idempotent Start orchestration with repository-owned
+bounded compensation and interrupted-owner recovery, and resumable End
+orchestration with cleanup-confirmed terminal commits.
 Detail and State combine an owned persistent session with one validated runtime
 snapshot; List remains persistent-only.
 
-End, runtime-failure handling, HTTP handlers, route registration, OpenAPI,
+Runtime-failure handling, HTTP handlers, route registration, OpenAPI,
 repositories, and production adapters belong to follow-up reviewable slices.
 No stub in this package returns fabricated success data. It does not change
 `main.go`, `go.work`, shared authentication, shared error responses, or
