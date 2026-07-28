@@ -87,6 +87,24 @@ type StartInput struct {
 	StartedBy      string
 }
 
+// EndInput carries authenticated ownership and a durable request identity.
+type EndInput struct {
+	AccountID      string
+	SessionID      string
+	IdempotencyKey string
+	RequestHash    string
+	TraceID        string
+	Reason         EndReason
+}
+
+// ResumeEndInput identifies a previously persisted EndIntent. Recovery never
+// accepts replacement idempotency metadata or a different terminal reason.
+type ResumeEndInput struct {
+	AccountID string
+	SessionID string
+	TraceID   string
+}
+
 // DetailInput identifies an account-scoped session read.
 type DetailInput struct {
 	AccountID string

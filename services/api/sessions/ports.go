@@ -121,9 +121,9 @@ type FailureTransitionParams struct {
 	ErrorCode string
 }
 
-// EndIntent persists a requested shutdown before cross-service cleanup is
-// confirmed. CompletedAt distinguishes a resumable intent from an audited,
-// completed request without deleting its idempotency record.
+// EndIntent persists the one durable shutdown identity for a session before
+// cross-service cleanup is attempted. CompletedAt distinguishes a resumable
+// intent from an audited, completed request without deleting idempotency data.
 type EndIntent struct {
 	SessionID      string
 	AccountID      string
@@ -159,7 +159,9 @@ type Repository interface {
 	// key owns a pending, compensating, or compensation_failed operation for the
 	// Session, it returns ErrSessionStartInProgress before readiness is checked.
 	// A compensated operation does not block a new key and is reported as
-	// ErrStartOperationNotFound.
+	// ErrStartOperationNotFound. Implementations must also make
+	// BeginStartOperation conflict with an incomplete EndIntent so a new
+	// runtime cannot start after shutdown persistence begins.
 	GetStartOperation(
 		ctx context.Context,
 		accountID string,
@@ -172,8 +174,15 @@ type Repository interface {
 	ClaimStartCompensation(ctx context.Context, params ClaimStartCompensationParams) (ClaimStartCompensationResult, error)
 	CompleteStartCompensation(ctx context.Context, params CompleteStartCompensationParams) error
 	FailStartCompensation(ctx context.Context, params FailStartCompensationParams) error
+	// SaveEndIntent atomically creates the session's only EndIntent. The same
+	// key and hash replay it; any different request identity conflicts. It must
+	// return ErrSessionStartInProgress while a pending, compensating, or
+	// compensation_failed StartOperation exists. This interlock and the inverse
+	// BeginStartOperation check prevent created -> ended from orphaning runtime.
 	SaveEndIntent(ctx context.Context, intent EndIntent) (saved EndIntent, replayed bool, err error)
 	GetEndIntent(ctx context.Context, accountID string, sessionID string) (EndIntent, error)
+	// CompleteEndIntent is idempotent after the business session reaches an
+	// immutable terminal state.
 	CompleteEndIntent(ctx context.Context, accountID string, sessionID string, completedAt time.Time) error
 	TransitionToActive(ctx context.Context, params StartTransitionParams) (session VoiceSession, replayed bool, err error)
 	TransitionToEnded(ctx context.Context, params EndTransitionParams) (VoiceSession, error)
@@ -185,6 +194,8 @@ type Repository interface {
 // with the same SessionID and OperationID are idempotent and return the latest
 // snapshot for that runtime; a different OperationID must not claim an existing
 // runtime and returns ErrRealtimeAlreadyRunning or ErrConcurrentTransition.
+// Stop is idempotent for one SessionID and EndReason. Success confirms all
+// owned resources are cleaned and returns a valid RuntimeStopped snapshot.
 type RealtimeLifecycle interface {
 	Start(ctx context.Context, command StartRealtimeCommand) (RuntimeSnapshot, error)
 	Stop(ctx context.Context, command StopRealtimeCommand) (RuntimeSnapshot, error)
