@@ -144,10 +144,15 @@ func (w *EndRecoveryWorker) ProcessNext(ctx context.Context) (bool, error) {
 	)
 }
 
+// recoverClaimed resumes the same cleanup-and-transition sequence used by the
+// request path while holding both a durable lease and the local Session lock.
 func (w *EndRecoveryWorker) recoverClaimed(
 	ctx context.Context,
 	intent EndIntent,
 ) error {
+	// Share the same process-local Session lock as request Start/End. The durable
+	// lease still supplies cross-process exclusion; this lock only avoids local
+	// duplicate calls while the worker holds that lease.
 	unlock, err := w.service.locks.lock(ctx, intent.SessionID)
 	if err != nil {
 		return err
@@ -165,6 +170,8 @@ func (w *EndRecoveryWorker) recoverClaimed(
 	); err != nil {
 		return err
 	}
+	// A previous attempt may have committed the terminal Session but crashed
+	// before completing the intent. Finishing the marker needs no second Stop.
 	if session.Status == StatusEnded || session.Status == StatusFailed {
 		return w.completeClaimed(ctx, intent)
 	}
@@ -189,6 +196,9 @@ func (w *EndRecoveryWorker) recoverClaimed(
 	return w.completeClaimed(ctx, intent)
 }
 
+// validateRecoveryEndIntent verifies that the worker still owns an unfinished,
+// internally consistent intent for the same immutable Session owner. Database
+// fencing performs the final lease-expiry check on each mutation.
 func validateRecoveryEndIntent(
 	intent EndIntent,
 	session VoiceSession,
@@ -206,6 +216,9 @@ func validateRecoveryEndIntent(
 	return nil
 }
 
+// reconcileTransition handles a concurrent-transition response after cleanup.
+// If another request already committed a terminal state, the worker completes
+// the same intent; otherwise it preserves the conflict for retry.
 func (w *EndRecoveryWorker) reconcileTransition(
 	ctx context.Context,
 	intent EndIntent,
@@ -226,6 +239,8 @@ func (w *EndRecoveryWorker) reconcileTransition(
 	return transitionErr
 }
 
+// completeClaimed marks recovery complete only through the worker-fenced
+// repository method, preventing a stale worker from overwriting a newer lease.
 func (w *EndRecoveryWorker) completeClaimed(
 	ctx context.Context,
 	intent EndIntent,
@@ -253,6 +268,8 @@ func (w *EndRecoveryWorker) completeClaimed(
 	return nil
 }
 
+// endRecoveryBackoff doubles delays up to maximum without overflowing when the
+// next multiplication would already reach the configured cap.
 func endRecoveryBackoff(initial time.Duration, maximum time.Duration, retryCount int) time.Duration {
 	delay := initial
 	for range retryCount {

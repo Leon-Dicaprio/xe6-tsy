@@ -6,6 +6,9 @@ import (
 	"fmt"
 )
 
+// startPendingOperation sends the durable OperationID across the realtime
+// boundary. Every error is treated as potentially uncertain because transport
+// failure may occur after the provider created the runtime.
 func (s *Service) startPendingOperation(
 	ctx context.Context,
 	input StartInput,
@@ -57,6 +60,8 @@ func (s *Service) reconcileUncertainStart(
 	)
 }
 
+// continueOwnedStartRuntime classifies a snapshot only after binding it to the
+// current Session and StartOperation.
 func (s *Service) continueOwnedStartRuntime(
 	ctx context.Context,
 	input StartInput,
@@ -64,6 +69,9 @@ func (s *Service) continueOwnedStartRuntime(
 	runtime RuntimeSnapshot,
 	uncertainErr error,
 ) (VoiceSession, error) {
+	// Ownership is checked before content or state. A valid-looking runtime from
+	// another OperationID must never activate this request or be stopped as its
+	// compensation.
 	if err := validateStartRuntimeOwnership(runtime, input.SessionID, operation.ID); err != nil {
 		return VoiceSession{}, err
 	}
@@ -71,6 +79,9 @@ func (s *Service) continueOwnedStartRuntime(
 		return s.compensateStartedOperation(ctx, input, operation, input.TraceID, err)
 	}
 
+	// Only media states that prove the pipeline is operating can commit active.
+	// Transitional states remain pending, while a confirmed terminal result from
+	// a synchronous successful Start requires owned compensation.
 	switch runtime.RuntimeState {
 	case RuntimeListening,
 		RuntimeASRProcessing,
@@ -96,6 +107,8 @@ func (s *Service) continueOwnedStartRuntime(
 	}
 }
 
+// mapRealtimeStartError preserves the provider cause while guaranteeing the
+// stable RealtimeStartFailed boundary is discoverable with errors.Is.
 func mapRealtimeStartError(ctx context.Context, err error) error {
 	mapped := mapDependencyError(ctx, err, ErrRealtimeStartFailed)
 	if !errors.Is(mapped, ErrRealtimeStartFailed) {
@@ -107,6 +120,8 @@ func mapRealtimeStartError(ctx context.Context, err error) error {
 	return mapped
 }
 
+// mapRuntimeReconciliationError distinguishes failure to read reconciliation
+// evidence from the original ambiguous Start error.
 func mapRuntimeReconciliationError(ctx context.Context, err error) error {
 	mapped := mapDependencyError(ctx, err, ErrRuntimeUnavailable)
 	if !errors.Is(mapped, ErrRuntimeUnavailable) {
@@ -118,6 +133,8 @@ func mapRuntimeReconciliationError(ctx context.Context, err error) error {
 	return fmt.Errorf("reconcile realtime start runtime: %w", mapped)
 }
 
+// activateOwnedStartRuntime obtains the business activation timestamp and asks
+// the repository to atomically commit Session and operation state.
 func (s *Service) activateOwnedStartRuntime(
 	ctx context.Context,
 	input StartInput,
@@ -143,6 +160,9 @@ func (s *Service) activateOwnedStartRuntime(
 	return s.compensateStartedOperation(ctx, input, operation, input.TraceID, originalErr)
 }
 
+// validateStartRuntimeOwnership binds the provider snapshot to both the
+// business Session and the exact durable StartOperation. This is the proof used
+// to resolve retries and ambiguous Start outcomes safely.
 func validateStartRuntimeOwnership(
 	runtime RuntimeSnapshot,
 	sessionID string,
@@ -159,6 +179,9 @@ func validateStartRuntimeOwnership(
 	return nil
 }
 
+// validateStartRuntimeContent applies envelope validation after ownership has
+// been established. It is kept separate so ownership failures are classified as
+// concurrency conflicts rather than provider-content failures.
 func validateStartRuntimeContent(runtime RuntimeSnapshot) error {
 	if !runtime.RuntimeState.Valid() || runtime.UpdatedAt.IsZero() {
 		return fmt.Errorf("%w: invalid start snapshot", ErrRealtimeStartFailed)

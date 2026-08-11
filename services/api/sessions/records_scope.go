@@ -16,6 +16,9 @@ type RecordsScopeRepository interface {
 	List(ctx context.Context, filter ListFilter) (ListPage, error)
 }
 
+// NewRecordsScopeReader requires an account-scoped persistent list provider.
+// A missing repository cannot safely degrade because it would make records
+// authorization incomplete.
 func NewRecordsScopeReader(repository RecordsScopeRepository) (*RecordsScopeReader, error) {
 	if repository == nil {
 		return nil, fmt.Errorf("create records session scope reader: repository is required")
@@ -35,6 +38,9 @@ func (r *RecordsScopeReader) SessionIDsForAccount(ctx context.Context, accountID
 	cursor := ""
 	seenCursors := map[string]struct{}{"": {}}
 	for {
+		// Consume the repository at its maximum supported page size because the
+		// downstream records query needs the complete authorization scope, not a
+		// user-facing partial page.
 		page, err := r.repository.List(ctx, ListFilter{
 			AccountID: accountID,
 			Cursor:    cursor,
@@ -52,6 +58,8 @@ func (r *RecordsScopeReader) SessionIDsForAccount(ctx context.Context, accountID
 		if page.NextCursor == nil {
 			return ids, nil
 		}
+		// A buggy repository returning an empty or repeated cursor would otherwise
+		// spin forever and hold the records request open.
 		nextCursor := *page.NextCursor
 		if nextCursor == "" {
 			return nil, fmt.Errorf("list sessions for records scope: invalid pagination cursor: %w", ErrInvalidRequest)

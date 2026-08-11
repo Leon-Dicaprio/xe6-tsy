@@ -37,6 +37,8 @@ func (s *Service) End(
 	requestOwner := "request:" + input.TraceID
 	leaseExpiresAt := requestedAt.Add(s.deps.EndRecoveryLeaseDuration)
 	leaseStartedAt := time.Now()
+	// Persist intent and acquire the request path's lease before any Stop call.
+	// From this point onward an interrupted request is recoverable from storage.
 	intent, _, err := s.deps.Repository.SaveEndIntent(ctx, EndIntent{
 		SessionID:      input.SessionID,
 		AccountID:      input.AccountID,
@@ -68,6 +70,8 @@ func (s *Service) End(
 	if leaseRemaining <= 0 {
 		return VoiceSession{}, ErrConcurrentTransition
 	}
+	// Every post-intent failure releases the lease and records an immediately due
+	// retry using a cancellation-independent persistence context.
 	defer func() {
 		if resultErr == nil {
 			return
@@ -107,6 +111,9 @@ func (s *Service) End(
 	}
 }
 
+// validateEndInput rejects malformed request identities before an EndIntent can
+// be persisted. Reason is part of the canonical request and cannot change on
+// an idempotent replay.
 func validateEndInput(input EndInput) error {
 	if err := validateIdentity(input.AccountID, input.SessionID); err != nil {
 		return err
@@ -120,6 +127,9 @@ func validateEndInput(input EndInput) error {
 	return nil
 }
 
+// validateEndIntent treats repository output as an integration contract. A
+// corrupt or mismatched durable intent must not authorize Stop or a terminal
+// business transition.
 func validateEndIntent(intent EndIntent, session VoiceSession, reason EndReason) error {
 	if intent.SessionID != session.ID ||
 		intent.AccountID != session.AccountID ||
@@ -135,6 +145,9 @@ func validateEndIntent(intent EndIntent, session VoiceSession, reason EndReason)
 	return nil
 }
 
+// endCreated transitions directly to ended because a created Session has no
+// active media resources. The repository Start/End interlock is what makes this
+// shortcut safe under concurrent requests.
 func (s *Service) endCreated(
 	ctx context.Context,
 	session VoiceSession,
@@ -151,6 +164,9 @@ func (s *Service) endCreated(
 	return ended, s.completeEndIntent(ctx, ended)
 }
 
+// transitionCreatedToEnded performs the business transition but deliberately
+// leaves EndIntent completion to the caller, allowing recovery from a process
+// interruption between those two durable writes.
 func (s *Service) transitionCreatedToEnded(
 	ctx context.Context,
 	session VoiceSession,
@@ -170,6 +186,8 @@ func (s *Service) transitionCreatedToEnded(
 	return ended, nil
 }
 
+// stopAndEndActive runs cleanup, commits the terminal business state, and only
+// then completes the intent. Each durable interruption point is replayable.
 func (s *Service) stopAndEndActive(
 	ctx context.Context,
 	session VoiceSession,
@@ -187,6 +205,9 @@ func (s *Service) stopAndEndActive(
 	return ended, s.completeEndIntent(ctx, ended)
 }
 
+// stopAndTransitionActive never writes ended until Realtime.Stop returns a
+// valid stopped snapshot for this Session. RPC success without stopped cleanup
+// confirmation is treated as a failed End attempt.
 func (s *Service) stopAndTransitionActive(
 	ctx context.Context,
 	session VoiceSession,
@@ -220,6 +241,9 @@ func (s *Service) stopAndTransitionActive(
 	return ended, nil
 }
 
+// validateStoppedRuntime is the cleanup-confirmation gate shared by request and
+// recovery paths. Transitional, failed, stale, or foreign snapshots keep the
+// prior business status unchanged.
 func validateStoppedRuntime(runtime RuntimeSnapshot, sessionID string) error {
 	if err := validateRuntimeSnapshot(runtime, sessionID); err != nil {
 		return fmt.Errorf("%w: invalid stop snapshot", ErrRealtimeStopFailed)
@@ -234,6 +258,8 @@ func validateStoppedRuntime(runtime RuntimeSnapshot, sessionID string) error {
 	return nil
 }
 
+// mapEndStopError retains not-implemented for deliberately deferred adapters
+// and otherwise wraps all Stop failures in the stable domain boundary.
 func mapEndStopError(ctx context.Context, err error) error {
 	if errors.Is(err, ErrNotImplemented) {
 		return ErrNotImplemented
@@ -244,6 +270,9 @@ func mapEndStopError(ctx context.Context, err error) error {
 	return fmt.Errorf("%w: %w", ErrRealtimeStopFailed, err)
 }
 
+// completeEndIntent records that cleanup and the terminal Session transition
+// have both committed. It is intentionally separate from TransitionToEnded so
+// the recovery worker can finish after a crash between writes.
 func (s *Service) completeEndIntent(
 	ctx context.Context,
 	session VoiceSession,

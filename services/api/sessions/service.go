@@ -10,6 +10,8 @@ import (
 	"time"
 )
 
+// Default budgets keep cleanup and reconciliation bounded while allowing
+// production composition to override them for deterministic tests or policy.
 const (
 	defaultCompensationTimeout        = 5 * time.Second
 	defaultStartReconciliationTimeout = 5 * time.Second
@@ -130,6 +132,9 @@ type ListInput struct {
 	Limit     int
 }
 
+// validateIdentity enforces the authorization boundary before any repository or
+// realtime call. An absent account is an authentication failure, while an
+// absent SessionID is malformed use-case input.
 func validateIdentity(accountID string, sessionID string) error {
 	if accountID == "" {
 		return ErrUnauthorized
@@ -140,6 +145,9 @@ func validateIdentity(accountID string, sessionID string) error {
 	return nil
 }
 
+// validateIdempotency requires both the caller-visible key and the canonical
+// request fingerprint. Persisting only the key would make different requests
+// indistinguishable during replay.
 func validateIdempotency(key string, requestHash string) error {
 	if key == "" || requestHash == "" {
 		return ErrInvalidRequest
@@ -147,6 +155,9 @@ func validateIdempotency(key string, requestHash string) error {
 	return nil
 }
 
+// validateRuntimeSnapshot verifies the minimum cross-service envelope shared by
+// query and Stop paths. State-specific rules, such as requiring stopped during
+// End, are intentionally applied by the calling workflow.
 func validateRuntimeSnapshot(snapshot RuntimeSnapshot, sessionID string) error {
 	if snapshot.SessionID != sessionID ||
 		!snapshot.RuntimeState.Valid() ||
@@ -156,6 +167,10 @@ func validateRuntimeSnapshot(snapshot RuntimeSnapshot, sessionID string) error {
 	return nil
 }
 
+// mapDependencyError preserves cancellation, deadlines, and the explicit
+// not-implemented signal while collapsing provider-specific failures behind a
+// stable sessions boundary. This keeps HTTP retry semantics independent from
+// provider error strings.
 func mapDependencyError(ctx context.Context, err error, boundary error) error {
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return ctxErr
@@ -170,6 +185,8 @@ func mapDependencyError(ctx context.Context, err error, boundary error) error {
 	return fmt.Errorf("%w: %v", boundary, err)
 }
 
+// validateAudioConfig enforces the currently supported media contract before a
+// Session is persisted or started. Provider negotiation does not occur here.
 func validateAudioConfig(config AudioConfig) error {
 	if config.Codec != "opus" || config.SampleRateHz != 48000 || config.Channels != 1 {
 		return ErrUnsupportedAudio
@@ -177,6 +194,9 @@ func validateAudioConfig(config AudioConfig) error {
 	return nil
 }
 
+// validateCapabilities requires the complete P0 terminal feature set. These
+// flags describe client capability; WebRTC readiness is checked separately
+// from the live connection snapshot during Start.
 func validateCapabilities(capabilities Capabilities) error {
 	if !capabilities.WebRTC ||
 		!capabilities.DataChannel ||
@@ -188,6 +208,9 @@ func validateCapabilities(capabilities Capabilities) error {
 	return nil
 }
 
+// decodeSessionReadiness revalidates persisted JSON before crossing the
+// realtime boundary. Treating stored data as trusted here could start a runtime
+// with legacy or corrupted capabilities that the current contract rejects.
 func decodeSessionReadiness(session VoiceSession) error {
 	var audio AudioConfig
 	if err := json.Unmarshal(session.AudioConfig, &audio); err != nil {
@@ -204,12 +227,16 @@ func decodeSessionReadiness(session VoiceSession) error {
 	return validateCapabilities(capabilities)
 }
 
+// compensationContext creates one bounded, cancellation-independent cleanup
+// step while retaining trace values from the original request.
 func (s *Service) compensationContext(parent context.Context) (context.Context, context.CancelFunc) {
 	// Compensation retains trace values but ignores client cancellation. Its
 	// independent timeout prevents a disconnected request from leaking cleanup.
 	return context.WithTimeout(context.WithoutCancel(parent), s.deps.CompensationTimeout)
 }
 
+// startReconciliationContext gives ambiguous Realtime.Start outcomes a fresh
+// bounded read-and-commit budget after the client request may have ended.
 func (s *Service) startReconciliationContext(
 	parent context.Context,
 ) (context.Context, context.CancelFunc) {
@@ -221,13 +248,20 @@ func (s *Service) startReconciliationContext(
 	)
 }
 
+// endAttemptContext caps request or worker cleanup by both configured attempt
+// timeout and remaining lease duration.
 func (s *Service) endAttemptContext(
 	parent context.Context,
 	leaseRemaining time.Duration,
 ) (context.Context, context.CancelFunc) {
+	// The attempt must finish before its durable lease can be reclaimed by
+	// another request or worker. The shorter budget wins if little lease time
+	// remains after repository work.
 	return context.WithTimeout(parent, min(s.deps.EndAttemptTimeout, leaseRemaining))
 }
 
+// endPersistenceContext lets failure bookkeeping release a durable lease even
+// after the public request context has been canceled.
 func (s *Service) endPersistenceContext(parent context.Context) (context.Context, context.CancelFunc) {
 	// A canceled request must still release its durable lease so recovery can
 	// resume immediately instead of waiting for expiration.

@@ -85,15 +85,21 @@ func (h *Handler) Register(mux *http.ServeMux, authenticate func(http.Handler) h
 	}
 }
 
+// createRequest is the public JSON shape. AccountID and idempotency metadata are
+// injected from authenticated request context and headers, not accepted here.
 type createRequest struct {
 	AudioConfig  *AudioConfig `json:"audio_config,omitempty"`
 	Capabilities Capabilities `json:"capabilities"`
 }
 
+// endRequest contains the only optional End body field; an omitted reason is
+// resolved before the request fingerprint is computed.
 type endRequest struct {
 	Reason EndReason `json:"reason,omitempty"`
 }
 
+// create converts the authenticated HTTP request into a canonical CreateInput.
+// Account ownership comes exclusively from middleware, never from JSON fields.
 func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 	accountID, err := h.requireAccount(r)
 	if err != nil {
@@ -124,6 +130,9 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 	writeHTTPJSON(w, http.StatusCreated, session)
 }
 
+// start rejects request bodies because the SessionID and authenticated actor are
+// the complete public command. The stable hash still includes the SessionID so
+// an idempotency key cannot be reused for a different Session.
 func (h *Handler) start(w http.ResponseWriter, r *http.Request) {
 	accountID, err := h.requireAccount(r)
 	if err != nil {
@@ -157,6 +166,9 @@ func (h *Handler) start(w http.ResponseWriter, r *http.Request) {
 	writeHTTPJSON(w, http.StatusOK, session)
 }
 
+// end defaults the public reason while preserving that resolved value in the
+// canonical request hash. Omitted and explicit default reasons therefore replay
+// the same durable intent.
 func (h *Handler) end(w http.ResponseWriter, r *http.Request) {
 	accountID, err := h.requireAccount(r)
 	if err != nil {
@@ -195,6 +207,7 @@ func (h *Handler) end(w http.ResponseWriter, r *http.Request) {
 	writeHTTPJSON(w, http.StatusOK, session)
 }
 
+// detail returns the persistent Session plus one validated realtime snapshot.
 func (h *Handler) detail(w http.ResponseWriter, r *http.Request) {
 	accountID, err := h.requireAccount(r)
 	if err != nil {
@@ -216,6 +229,7 @@ func (h *Handler) detail(w http.ResponseWriter, r *http.Request) {
 	writeHTTPJSON(w, http.StatusOK, detail)
 }
 
+// state exposes the compact projection intended for client polling.
 func (h *Handler) state(w http.ResponseWriter, r *http.Request) {
 	accountID, err := h.requireAccount(r)
 	if err != nil {
@@ -237,6 +251,8 @@ func (h *Handler) state(w http.ResponseWriter, r *http.Request) {
 	writeHTTPJSON(w, http.StatusOK, state)
 }
 
+// mintRealtimeTicket issues a short-lived credential only after the ticket
+// boundary independently verifies Session ownership.
 func (h *Handler) mintRealtimeTicket(w http.ResponseWriter, r *http.Request) {
 	accountID, err := h.requireAccount(r)
 	if err != nil {
@@ -259,6 +275,8 @@ func (h *Handler) mintRealtimeTicket(w http.ResponseWriter, r *http.Request) {
 	writeHTTPJSON(w, http.StatusOK, ticket)
 }
 
+// list accepts only persistent filters. Runtime and connection filters are
+// deliberately absent so one page never expands into cross-service N+1 calls.
 func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
 	accountID, err := h.requireAccount(r)
 	if err != nil {
@@ -291,6 +309,8 @@ func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
 	writeHTTPJSON(w, http.StatusOK, page)
 }
 
+// requireAccount reads identity previously injected by trusted authentication
+// middleware. Raw headers or request bodies are not authorization sources.
 func (h *Handler) requireAccount(r *http.Request) (string, error) {
 	accountID, ok := h.accountID(r)
 	if !ok || accountID == "" {
@@ -299,6 +319,8 @@ func (h *Handler) requireAccount(r *http.Request) (string, error) {
 	return accountID, nil
 }
 
+// parseListLimit preserves zero as "use the service default" and rejects values
+// outside the contract before invoking a use case.
 func parseListLimit(raw string) (int, error) {
 	if raw == "" {
 		return 0, nil
@@ -310,6 +332,9 @@ func parseListLimit(raw string) (int, error) {
 	return limit, nil
 }
 
+// decodeHTTPJSON accepts exactly one bounded JSON object and rejects unknown
+// fields or trailing values. The body limit prevents unbounded allocation at
+// the public boundary.
 func decodeHTTPJSON(r *http.Request, target any) error {
 	defer r.Body.Close()
 	decoder := json.NewDecoder(io.LimitReader(r.Body, maxHTTPBodyBytes))
@@ -323,6 +348,8 @@ func decodeHTTPJSON(r *http.Request, target any) error {
 	return nil
 }
 
+// decodeOptionalHTTPJSON applies the same strict decoding contract while
+// allowing an empty body for commands with complete server-side defaults.
 func decodeOptionalHTTPJSON(r *http.Request, target any) error {
 	defer r.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxHTTPBodyBytes))
@@ -343,6 +370,8 @@ func decodeOptionalHTTPJSON(r *http.Request, target any) error {
 	return nil
 }
 
+// rejectNonEmptyBody enforces bodyless command contracts without trusting
+// Content-Length, which may be absent for streamed requests.
 func rejectNonEmptyBody(r *http.Request) error {
 	defer r.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxHTTPBodyBytes))
@@ -355,6 +384,9 @@ func rejectNonEmptyBody(r *http.Request) error {
 	return nil
 }
 
+// canonicalHash namespaces a deterministic JSON fingerprint by operation. The
+// NUL separator prevents ambiguous concatenation, and the namespace prevents
+// one Idempotency-Key payload from matching a different command type.
 func canonicalHash(operation string, value any) string {
 	payload, err := json.Marshal(value)
 	if err != nil {
@@ -364,10 +396,12 @@ func canonicalHash(operation string, value any) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// httpErrorEnvelope preserves one stable top-level error object for clients.
 type httpErrorEnvelope struct {
 	Error httpErrorDetail `json:"error"`
 }
 
+// httpErrorDetail exposes only stable, non-sensitive failure information.
 type httpErrorDetail struct {
 	Code      string         `json:"code"`
 	Message   string         `json:"message"`
@@ -376,12 +410,15 @@ type httpErrorDetail struct {
 	Details   map[string]any `json:"details"`
 }
 
+// writeHTTPJSON applies the module's JSON content type and status consistently.
 func writeHTTPJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
 }
 
+// writeHTTPError emits the stable public envelope and never exposes wrapped
+// provider or persistence details to clients.
 func writeHTTPError(w http.ResponseWriter, r *http.Request, err error) {
 	status, code, message := statusCodeForError(err)
 	writeHTTPJSON(w, status, httpErrorEnvelope{
@@ -395,6 +432,8 @@ func writeHTTPError(w http.ResponseWriter, r *http.Request, err error) {
 	})
 }
 
+// statusCodeForError is the single public mapping from wrapped domain errors to
+// HTTP semantics. errors.Is keeps the mapping stable through contextual wraps.
 func statusCodeForError(err error) (int, ErrorCode, string) {
 	switch {
 	case errors.Is(err, ErrInvalidRequest):
@@ -432,6 +471,8 @@ func statusCodeForError(err error) (int, ErrorCode, string) {
 	}
 }
 
+// requestIDFromHTTP returns the upstream trace identity or a visible sentinel;
+// it never invents a random value that cannot be correlated with server logs.
 func requestIDFromHTTP(r *http.Request) string {
 	if requestID := r.Header.Get("X-Request-ID"); requestID != "" {
 		return requestID

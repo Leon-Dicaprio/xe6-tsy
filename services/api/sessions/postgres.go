@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// Shared scan projections keep column order identical across repository reads.
 const (
 	sessionColumns = `id, account_id, status, audio_config, capabilities,
 		started_at, ended_at, created_at`
@@ -31,6 +32,9 @@ type PostgresRepository struct {
 	pool *pgxpool.Pool
 }
 
+// NewPostgresRepository binds Session persistence to one shared PostgreSQL
+// pool. Construction does not probe the database; each operation fails closed
+// through ready when the pool is absent.
 func NewPostgresRepository(pool *pgxpool.Pool) *PostgresRepository {
 	return &PostgresRepository{pool: pool}
 }
@@ -38,6 +42,9 @@ func NewPostgresRepository(pool *pgxpool.Pool) *PostgresRepository {
 var _ Repository = (*PostgresRepository)(nil)
 var _ SessionReader = (*PostgresRepository)(nil)
 
+// Create atomically persists a business Session and its idempotency result. If
+// the key already exists with the same hash, it returns the original Session;
+// a different hash is a conflict. No realtime row is created by this method.
 func (r *PostgresRepository) Create(
 	ctx context.Context,
 	params CreateParams,
@@ -65,6 +72,8 @@ func (r *PostgresRepository) Create(
 	}
 	defer tx.Rollback(ctx)
 
+	// Read the idempotency record inside the transaction before inserting either
+	// row. This is the fast path for normal sequential retries.
 	stored, found, err := findCreateRequest(ctx, tx, params.AccountID, params.IdempotencyKey)
 	if err != nil {
 		return VoiceSession{}, false, postgresError("read create request", err)
@@ -92,6 +101,8 @@ func (r *PostgresRepository) Create(
 		return VoiceSession{}, false, postgresError("insert session", err)
 	}
 
+	// The unique key handles concurrent creators that both missed the initial
+	// read. Only the transaction that binds its Session to the key may commit.
 	var inserted int
 	err = tx.QueryRow(ctx, `
 		INSERT INTO voice_session_create_requests (
@@ -122,6 +133,9 @@ func (r *PostgresRepository) Create(
 	return session, false, nil
 }
 
+// replayCreate resolves the winning transaction after a concurrent insert. It
+// runs outside the rolled-back losing transaction so PostgreSQL can observe the
+// committed idempotency record and its bound Session.
 func (r *PostgresRepository) replayCreate(
 	ctx context.Context,
 	accountID string,
@@ -146,6 +160,9 @@ func (r *PostgresRepository) replayCreate(
 	return session, true, postgresError("read winning session", err)
 }
 
+// GetOwned authorizes actorAccountID through account lineage and deliberately
+// returns not-found for both absent and foreign Sessions, avoiding an ownership
+// existence oracle.
 func (r *PostgresRepository) GetOwned(
 	ctx context.Context,
 	accountID string,
@@ -166,6 +183,8 @@ func (r *PostgresRepository) GetOwned(
 	return session, postgresError("get owned session", err)
 }
 
+// GetSession is the trusted internal read required by SessionReader. It bypasses
+// actor authorization and therefore must never be used for a public request.
 func (r *PostgresRepository) GetSession(
 	ctx context.Context,
 	sessionID string,
@@ -190,6 +209,8 @@ func (r *PostgresRepository) GetSession(
 	}, nil
 }
 
+// List returns an account-lineage-scoped persistent projection using descending
+// keyset pagination. It neither joins nor calls realtime state.
 func (r *PostgresRepository) List(
 	ctx context.Context,
 	filter ListFilter,
@@ -222,6 +243,8 @@ func (r *PostgresRepository) List(
 			"(created_at, id) < ($%d, $%d)", len(args)-1, len(args),
 		))
 	}
+	// Fetch one extra row to decide whether a continuation cursor is required
+	// without issuing a separate count query.
 	args = append(args, filter.Limit+1)
 	query := `
 		SELECT id, account_id, status, started_at, ended_at, created_at
@@ -272,15 +295,21 @@ func (r *PostgresRepository) List(
 	return page, nil
 }
 
+// createRequestRecord is the minimal idempotency lookup needed to replay Create.
 type createRequestRecord struct {
 	requestHash string
 	sessionID   string
 }
 
+// queryRower is implemented by both pgxpool.Pool and pgx.Tx, allowing helpers to
+// preserve identical scan behavior inside and outside transactions.
 type queryRower interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }
 
+// findCreateRequest reads the key-to-result binding without treating absence as
+// an error, allowing both the initial create and race-resolution paths to share
+// the same scan semantics.
 func findCreateRequest(
 	ctx context.Context,
 	db queryRower,
@@ -344,6 +373,9 @@ func getSessionTrusted(
 	return querySession(ctx, db, query, []any{sessionID}, forUpdate)
 }
 
+// querySession centralizes row locking and storage-to-domain validation. Invalid
+// persisted states fail immediately instead of propagating corrupt lifecycle
+// values into Service decisions.
 func querySession(
 	ctx context.Context,
 	db queryRower,
@@ -371,6 +403,8 @@ func querySession(
 	return session, nil
 }
 
+// scanStartOperation validates every enum and timestamp combination needed by
+// Start recovery. It intentionally does not infer defaults for legacy rows.
 func scanStartOperation(row pgx.Row) (StartOperation, error) {
 	var operation StartOperation
 	var status string
@@ -391,6 +425,8 @@ func scanStartOperation(row pgx.Row) (StartOperation, error) {
 	return operation, nil
 }
 
+// scanEndIntent maps nullable recovery fields without deciding lease validity;
+// repository mutations perform lease fencing against the database clock.
 func scanEndIntent(row pgx.Row) (EndIntent, error) {
 	var intent EndIntent
 	var reason string
@@ -410,6 +446,8 @@ func scanEndIntent(row pgx.Row) (EndIntent, error) {
 	return intent, nil
 }
 
+// ready provides a uniform fail-closed guard for a repository constructed
+// without its required database pool.
 func (r *PostgresRepository) ready() error {
 	if r == nil || r.pool == nil {
 		return ErrInvalidDependency
@@ -417,6 +455,8 @@ func (r *PostgresRepository) ready() error {
 	return nil
 }
 
+// constraintName extracts a PostgreSQL constraint identifier for narrow race
+// classification. Other database failures remain wrapped infrastructure errors.
 func constraintName(err error) string {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
@@ -425,6 +465,8 @@ func constraintName(err error) string {
 	return ""
 }
 
+// postgresError adds operation context while preserving cancellation and
+// existing session-domain errors for errors.Is classification at higher layers.
 func postgresError(operation string, err error) error {
 	if err == nil {
 		return nil
@@ -435,6 +477,8 @@ func postgresError(operation string, err error) error {
 	return fmt.Errorf("sessions postgres %s: %w", operation, err)
 }
 
+// validTimestamp rejects zero or non-positive wall-clock values before they can
+// violate lifecycle ordering assumptions in persistent rows.
 func validTimestamp(at time.Time) bool {
 	return !at.IsZero() && at.Location() != nil
 }

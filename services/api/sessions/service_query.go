@@ -6,6 +6,8 @@ import (
 	"fmt"
 )
 
+// List bounds protect storage and response size while zero remains a convenient
+// service-level request for the default page size.
 const (
 	defaultListLimit = 20
 	maxListLimit     = 100
@@ -80,6 +82,8 @@ func (s *Service) List(ctx context.Context, input ListInput) (ListPage, error) {
 	return page, nil
 }
 
+// readOwnedWithRuntime composes authorized durable state and one live runtime
+// read without storing the resulting mixed projection.
 func (s *Service) readOwnedWithRuntime(
 	ctx context.Context,
 	input DetailInput,
@@ -91,6 +95,9 @@ func (s *Service) readOwnedWithRuntime(
 		return VoiceSession{}, RuntimeSnapshot{}, err
 	}
 
+	// Authorize and load persistent state before asking realtime. This order both
+	// avoids leaking runtime existence and prevents a dependency call for a
+	// Session the actor does not own.
 	session, err := s.deps.Repository.GetOwned(ctx, input.AccountID, input.SessionID)
 	if err != nil {
 		return VoiceSession{}, RuntimeSnapshot{}, fmt.Errorf("read owned voice session: %w", err)
@@ -103,6 +110,9 @@ func (s *Service) readOwnedWithRuntime(
 	return session, runtime, nil
 }
 
+// readRuntimeForSession distinguishes an explicitly absent runtime record from
+// a dependency failure. Only the former may be interpreted from durable
+// business state; timeouts and provider failures must remain visible.
 func (s *Service) readRuntimeForSession(
 	ctx context.Context,
 	session VoiceSession,

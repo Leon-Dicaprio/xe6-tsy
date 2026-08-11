@@ -29,6 +29,8 @@ func (r *PostgresRepository) ClaimPendingEndIntent(
 	}
 	defer tx.Rollback(ctx)
 
+	// Selection and row lock occur in one transaction. SKIP LOCKED lets multiple
+	// workers make progress on different Sessions without waiting for each other.
 	intent, err := scanEndIntent(tx.QueryRow(ctx, `
 		SELECT `+endIntentColumns+`
 		FROM voice_session_end_intents
@@ -47,6 +49,8 @@ func (r *PostgresRepository) ClaimPendingEndIntent(
 	if err != nil {
 		return EndIntent{}, false, postgresError("scan pending end intent", err)
 	}
+	// Lease duration comes from validated caller configuration, but expiration is
+	// anchored to clock_timestamp() so database time is the shared authority.
 	claimed, err := scanEndIntent(tx.QueryRow(ctx, `
 		UPDATE voice_session_end_intents
 		SET recovery_owner = $1,
@@ -78,6 +82,8 @@ func (r *PostgresRepository) RetryClaimedEndIntent(
 		params.RetryAfter < 0 {
 		return ErrInvalidRequest
 	}
+	// The owner and unexpired-lease predicates fence stale workers. A zero-row
+	// update means another request or worker now owns the intent.
 	result, err := r.pool.Exec(ctx, `
 		UPDATE voice_session_end_intents
 		SET retry_count = retry_count + 1,
@@ -139,6 +145,9 @@ func (r *PostgresRepository) CompleteClaimedEndIntent(
 	if !found {
 		return ErrEndIntentNotFound
 	}
+	// A request path may have completed the same intent while the worker was
+	// reconciling a concurrent transition. Treat that terminal marker as an
+	// idempotent completion without requiring the old worker lease.
 	if intent.Completed() {
 		return postgresError("commit claimed end completion replay", tx.Commit(ctx))
 	}
@@ -148,6 +157,8 @@ func (r *PostgresRepository) CompleteClaimedEndIntent(
 	if params.CompletedAt.Before(intent.RequestedAt) {
 		return ErrInvalidRequest
 	}
+	// The final update repeats the owner and lease predicates under lock. This
+	// protects against expiration while the worker was performing Stop.
 	result, err := tx.Exec(ctx, `
 		UPDATE voice_session_end_intents
 		SET completed_at = $1,

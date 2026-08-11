@@ -9,6 +9,9 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+// SaveEndIntent persists shutdown intent and grants the request path a bounded
+// execution lease before Realtime.Stop. It also atomically interlocks with any
+// unresolved StartOperation so created-to-ended cannot orphan a runtime.
 func (r *PostgresRepository) SaveEndIntent(
 	ctx context.Context,
 	intent EndIntent,
@@ -42,6 +45,8 @@ func (r *PostgresRepository) SaveEndIntent(
 		}
 		return EndIntent{}, false, postgresError("lock session for end intent", err)
 	}
+	// Authorization may be granted through account lineage, but durable child
+	// rows always retain the immutable owner stored on voice_sessions.
 	intent.AccountID = session.AccountID
 	var unresolvedStart bool
 	if err := tx.QueryRow(ctx, `
@@ -69,6 +74,9 @@ func (r *PostgresRepository) SaveEndIntent(
 		if existing.Completed() {
 			return existing, true, nil
 		}
+		// A replay must acquire an expired or vacant lease before it may call Stop.
+		// An active request/worker lease returns a concurrency conflict instead of
+		// allowing two cleanup calls to overlap.
 		updated, err := scanEndIntent(tx.QueryRow(ctx, `
 			UPDATE voice_session_end_intents
 			SET recovery_owner = $1,
@@ -93,6 +101,8 @@ func (r *PostgresRepository) SaveEndIntent(
 		return updated, true, nil
 	}
 
+	// The database clock anchors next-attempt and lease expiry. API hosts may have
+	// skewed clocks, so caller timestamps define duration but not lease authority.
 	saved, err := scanEndIntent(tx.QueryRow(ctx, `
 		INSERT INTO voice_session_end_intents (
 			session_id, account_id, reason, idempotency_key, request_hash,
@@ -123,6 +133,8 @@ func (r *PostgresRepository) SaveEndIntent(
 	return saved, false, nil
 }
 
+// resolveEndIntentRace reads the key winner after a concurrent unique-key
+// insert. Only the same Session, request hash, and valid reason are replayable.
 func (r *PostgresRepository) resolveEndIntentRace(
 	ctx context.Context,
 	intent EndIntent,
@@ -148,6 +160,9 @@ func (r *PostgresRepository) resolveEndIntentRace(
 	return stored, true, nil
 }
 
+// GetEndIntent authorizes the current actor but reads the intent using the
+// immutable owner. Absence is reported as EndIntentNotFound without exposing a
+// foreign Session.
 func (r *PostgresRepository) GetEndIntent(
 	ctx context.Context,
 	accountID string,
@@ -180,6 +195,9 @@ func (r *PostgresRepository) GetEndIntent(
 	return intent, nil
 }
 
+// CompleteEndIntent marks a request-path intent complete only after the Session
+// is already terminal. The update clears its execution lease so no worker keeps
+// treating completed work as owned.
 func (r *PostgresRepository) CompleteEndIntent(
 	ctx context.Context,
 	accountID string,
@@ -239,6 +257,8 @@ func (r *PostgresRepository) CompleteEndIntent(
 	return nil
 }
 
+// endIntentBySession optionally locks one intent row and treats absence as a
+// boolean result, allowing callers to distinguish it from database failure.
 func endIntentBySession(
 	ctx context.Context,
 	db queryRower,
@@ -259,6 +279,9 @@ func endIntentBySession(
 	return intent, err == nil, err
 }
 
+// TransitionToActive atomically changes VoiceSession created-to-active and the
+// matching StartOperation pending-to-completed. The operation identity and hash
+// are verified before expected state so an exact active replay is idempotent.
 func (r *PostgresRepository) TransitionToActive(
 	ctx context.Context,
 	params StartTransitionParams,
@@ -306,6 +329,8 @@ func (r *PostgresRepository) TransitionToActive(
 	if operation.RequestHash != params.RequestHash {
 		return VoiceSession{}, false, ErrIdempotencyKeyConflict
 	}
+	// This is the only replayable terminal pair. Any partial or mismatched pair
+	// indicates a concurrent transition or corrupted invariant.
 	if operation.Status == StartOperationCompleted && session.Status == StatusActive {
 		if err := tx.Commit(ctx); err != nil {
 			return VoiceSession{}, false, postgresError("commit activation replay", err)
@@ -318,6 +343,9 @@ func (r *PostgresRepository) TransitionToActive(
 		params.StartedAt.Before(operation.CreatedAt) {
 		return VoiceSession{}, false, ErrConcurrentTransition
 	}
+	// These two updates must commit together: an active Session without a
+	// completed owner Operation would make later retries unable to prove which
+	// runtime instance owns the business activation.
 	if _, err := tx.Exec(ctx, `
 		UPDATE voice_sessions
 		SET status = 'active', started_at = $1
@@ -344,6 +372,9 @@ func (r *PostgresRepository) TransitionToActive(
 	return session, false, nil
 }
 
+// TransitionToEnded commits cleanup-confirmed created/active-to-ended state.
+// Realtime cleanup is intentionally outside this repository; callers may invoke
+// this method only after applying the workflow's Stop requirements.
 func (r *PostgresRepository) TransitionToEnded(
 	ctx context.Context,
 	params EndTransitionParams,
@@ -395,6 +426,9 @@ func (r *PostgresRepository) TransitionToEnded(
 	return session, nil
 }
 
+// TransitionToFailed records an unrecoverable active-session failure after the
+// trusted caller confirms realtime resources are cleaned. Terminal timestamp
+// and stable failure code are committed with the business state.
 func (r *PostgresRepository) TransitionToFailed(
 	ctx context.Context,
 	params FailureTransitionParams,

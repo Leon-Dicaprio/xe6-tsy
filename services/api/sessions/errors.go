@@ -5,6 +5,8 @@ import "errors"
 // ErrorCode is a stable machine-readable session module failure.
 type ErrorCode string
 
+// Stable public error codes. Adapter-only sentinels are intentionally excluded
+// from this group so they cannot leak into the HTTP contract.
 const (
 	CodeInvalidDependency      ErrorCode = "invalid_dependency"
 	CodeInvalidRequest         ErrorCode = "invalid_request"
@@ -25,6 +27,8 @@ const (
 	CodeNotImplemented         ErrorCode = "not_implemented"
 )
 
+// Domain sentinels support errors.Is classification across Service, Repository,
+// adapters, and HTTP mapping without comparing error strings.
 var (
 	ErrInvalidDependency      = errors.New(string(CodeInvalidDependency))
 	ErrInvalidRequest         = errors.New(string(CodeInvalidRequest))

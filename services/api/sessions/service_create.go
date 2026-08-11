@@ -23,6 +23,8 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (VoiceSession, 
 
 	audioConfig := DefaultAudioConfig()
 	if input.AudioConfig != nil {
+		// The explicit client snapshot replaces the complete default object; fields
+		// are not merged individually so request hashing and persistence agree.
 		audioConfig = *input.AudioConfig
 	}
 	if err := validateAudioConfig(audioConfig); err != nil {
@@ -37,6 +39,9 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (VoiceSession, 
 	if now.IsZero() {
 		return VoiceSession{}, fmt.Errorf("%w: clock returned a zero timestamp", ErrInvalidDependency)
 	}
+	// Repository.Create atomically stores both the Session and the key/hash
+	// result. A replay may ignore this newly generated ID and return the original
+	// Session, which is why ID generation itself is not the idempotency boundary.
 	session, _, err := s.deps.Repository.Create(ctx, CreateParams{
 		ID:             sessionID,
 		AccountID:      input.AccountID,

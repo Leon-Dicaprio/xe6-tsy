@@ -35,6 +35,8 @@ func (s *Service) Start(ctx context.Context, input StartInput) (VoiceSession, er
 	}
 }
 
+// startCreatedSession either resumes durable work or validates prerequisites and
+// creates a new pending operation before crossing into realtime.
 func (s *Service) startCreatedSession(
 	ctx context.Context,
 	input StartInput,
@@ -46,6 +48,9 @@ func (s *Service) startCreatedSession(
 			ErrInvalidDependency,
 		)
 	}
+	// Recovery is checked before current readiness. A durable compensating
+	// operation must finish cleanup even if Language or WebRTC has since become
+	// unavailable; applying new-start prerequisites first could strand it.
 	operation, found, err := s.findStartOperation(
 		ctx, input, session.AccountID,
 	)
@@ -65,6 +70,10 @@ func (s *Service) startCreatedSession(
 	return s.continueStartOperation(ctx, input, operation)
 }
 
+// findStartOperation resolves the actor through Repository authorization but
+// verifies the returned operation against the Session's immutable owner. It
+// also distinguishes "no matching operation" from another unresolved Start
+// that already owns this Session.
 func (s *Service) findStartOperation(
 	ctx context.Context,
 	input StartInput,
@@ -104,6 +113,9 @@ func (s *Service) findStartOperation(
 	return operation, true, nil
 }
 
+// continueExistingStartOperation resumes from durable state instead of
+// restarting the workflow. Pending work still needs current readiness;
+// compensating work must resume with its persisted claim regardless of it.
 func (s *Service) continueExistingStartOperation(
 	ctx context.Context,
 	input StartInput,
@@ -123,6 +135,9 @@ func (s *Service) continueExistingStartOperation(
 	}
 }
 
+// validateStartInput checks stable request identity before locking or invoking
+// dependencies. StartedBy defaults to the authenticated actor for auditability,
+// but ownership remains determined by Repository.GetOwned.
 func validateStartInput(ctx context.Context, input *StartInput) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -142,6 +157,9 @@ func validateStartInput(ctx context.Context, input *StartInput) error {
 	return nil
 }
 
+// validateStartReadiness checks three independent prerequisites: persisted
+// terminal capabilities, an active two-direction language config, and a live
+// connected WebRTC transport. None of these checks mutates durable state.
 func (s *Service) validateStartReadiness(
 	ctx context.Context,
 	input StartInput,
@@ -171,6 +189,9 @@ func (s *Service) validateStartReadiness(
 	return nil
 }
 
+// beginStartOperation persists the OperationID before Realtime.Start. The
+// repository may return an existing operation for an idempotent replay, so the
+// result is revalidated against Session, owner, key, hash, and known status.
 func (s *Service) beginStartOperation(
 	ctx context.Context,
 	input StartInput,
@@ -218,6 +239,9 @@ func (s *Service) beginStartOperation(
 	return operation, nil
 }
 
+// replayCompletedStart proves that an already-active Session was activated by
+// the same durable request. Merely seeing StatusActive is insufficient because
+// a different idempotency key must not claim another request's result.
 func (s *Service) replayCompletedStart(
 	ctx context.Context,
 	input StartInput,
@@ -233,6 +257,8 @@ func (s *Service) replayCompletedStart(
 	return current, nil
 }
 
+// continueStartOperation dispatches solely from the repository-owned operation
+// state. Terminal compensation states intentionally do not call realtime.
 func (s *Service) continueStartOperation(
 	ctx context.Context,
 	input StartInput,
@@ -261,6 +287,8 @@ func (s *Service) continueStartOperation(
 	}
 }
 
+// resumeStartCompensation reuses the persisted ClaimID. Generating a new claim
+// would violate the cleanup ownership fence after a process restart.
 func (s *Service) resumeStartCompensation(
 	ctx context.Context,
 	input StartInput,
@@ -278,6 +306,9 @@ func (s *Service) resumeStartCompensation(
 	)
 }
 
+// validateCompensatedRuntime requires positive cleanup confirmation, not merely
+// a successful Stop RPC. A mismatched, stale, or non-stopped snapshot leaves
+// compensation failed and recoverable.
 func validateCompensatedRuntime(runtime RuntimeSnapshot, sessionID string) error {
 	if err := validateRuntimeSnapshot(runtime, sessionID); err != nil {
 		return fmt.Errorf("%w: invalid compensation snapshot", ErrRealtimeStopFailed)
@@ -333,6 +364,8 @@ func (s *Service) compensateStartedOperation(
 		return VoiceSession{}, errors.Join(originalErr, timeErr)
 	}
 
+	// Claim is the destructive-action authorization boundary. A successful
+	// Realtime.Start or matching SessionID alone never grants permission to Stop.
 	claimCtx, claimCancel := s.compensationContext(parent)
 	claim, claimErr := s.deps.Repository.ClaimStartCompensation(
 		claimCtx,
@@ -357,6 +390,8 @@ func (s *Service) compensateStartedOperation(
 		return s.resolveDeniedStartCompensation(resolveCtx, input, originalErr)
 	}
 
+	// Stop receives a fresh budget after Claim so a slow repository cannot spend
+	// the media cleanup timeout before cleanup begins.
 	stopCtx, stopCancel := s.compensationContext(parent)
 	runtime, stopErr := s.deps.Realtime.Stop(stopCtx, StopRealtimeCommand{
 		SessionID: input.SessionID,
@@ -371,6 +406,9 @@ func (s *Service) compensateStartedOperation(
 	}
 	stopCancel()
 
+	// Terminal persistence gets another independent budget. Even a timed-out Stop
+	// must record compensation_failed when possible so recovery does not depend
+	// on logs or the lifetime of this process.
 	persistCtx, persistCancel := s.compensationPersistenceContext(parent)
 	defer persistCancel()
 	if stopErr == nil {
@@ -392,6 +430,9 @@ func (s *Service) compensateStartedOperation(
 	)
 }
 
+// completeStartCompensation records confirmed cleanup as compensated while
+// returning the original activation error to the caller. The failed Start does
+// not become a successful request merely because rollback succeeded.
 func (s *Service) completeStartCompensation(
 	ctx context.Context,
 	input StartInput,
@@ -428,6 +469,9 @@ func (s *Service) completeStartCompensation(
 	return VoiceSession{}, originalErr
 }
 
+// failStartCompensation persists uncertain cleanup and joins the activation,
+// Stop, and persistence causes so callers can classify both the stable session
+// error and the underlying failure.
 func (s *Service) failStartCompensation(
 	ctx context.Context,
 	input StartInput,
@@ -475,6 +519,9 @@ func (s *Service) failStartCompensation(
 	)
 }
 
+// resolveDeniedStartCompensation handles a lost race without destructive work.
+// If another instance committed activation, it replays that result; otherwise
+// it reports in-progress and leaves the current owner responsible for cleanup.
 func (s *Service) resolveDeniedStartCompensation(
 	ctx context.Context,
 	input StartInput,

@@ -9,6 +9,9 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+// GetStartOperation returns the matching durable request or reports whether a
+// different unresolved request currently owns the Session. Compensated work no
+// longer blocks a new key, while compensation_failed remains a safety fence.
 func (r *PostgresRepository) GetStartOperation(
 	ctx context.Context,
 	accountID string,
@@ -63,6 +66,9 @@ func (r *PostgresRepository) GetStartOperation(
 	return StartOperation{}, ErrStartOperationNotFound
 }
 
+// BeginStartOperation locks the business Session, enforces the Start/End
+// interlock, and persists pending ownership before realtime is called. Database
+// uniqueness constraints resolve races across API instances.
 func (r *PostgresRepository) BeginStartOperation(
 	ctx context.Context,
 	params BeginStartOperationParams,
@@ -92,6 +98,9 @@ func (r *PostgresRepository) BeginStartOperation(
 	}
 	ownerAccountID := session.AccountID
 
+	// Once an EndIntent exists, no new runtime may be created until that shutdown
+	// reaches a terminal result; otherwise End could complete while Start leaves
+	// media resources behind.
 	var incompleteEnd bool
 	if err := tx.QueryRow(ctx, `
 		SELECT EXISTS (
@@ -118,6 +127,8 @@ func (r *PostgresRepository) BeginStartOperation(
 	if session.Status != StatusCreated {
 		return BeginStartOperationResult{}, ErrConcurrentTransition
 	}
+	// This explicit check produces a stable domain error on the common path. The
+	// partial unique index below remains the final authority for concurrent races.
 	var unresolved bool
 	if err := tx.QueryRow(ctx, `
 		SELECT EXISTS (
@@ -160,6 +171,9 @@ func (r *PostgresRepository) BeginStartOperation(
 	return BeginStartOperationResult{Operation: operation}, nil
 }
 
+// resolveBeginStartRace classifies a unique-constraint loser after its
+// transaction has rolled back. A per-Session unfinished-operation conflict is
+// not an idempotent replay; a per-account key conflict may be.
 func (r *PostgresRepository) resolveBeginStartRace(
 	ctx context.Context,
 	params BeginStartOperationParams,
@@ -182,6 +196,9 @@ func (r *PostgresRepository) resolveBeginStartRace(
 	return classifyBeginReplay(existing, params)
 }
 
+// classifyBeginReplay applies the durable StartOperation state machine to a
+// reused idempotency key. Only pending, compensating, and completed operations
+// remain replayable by the identical request.
 func classifyBeginReplay(
 	existing StartOperation,
 	params BeginStartOperationParams,
@@ -203,6 +220,8 @@ func classifyBeginReplay(
 	}
 }
 
+// startOperationByAccountKey resolves idempotency identity independently from
+// Session status so replay classification can produce the correct conflict.
 func startOperationByAccountKey(
 	ctx context.Context,
 	db queryRower,
@@ -220,6 +239,9 @@ func startOperationByAccountKey(
 	return operation, err == nil, err
 }
 
+// ClaimStartCompensation is the exclusive authorization to issue a destructive
+// compensating Stop. It locks Session then Operation in the same order as other
+// lifecycle mutations, and permits reentry only for the persisted ClaimID.
 func (r *PostgresRepository) ClaimStartCompensation(
 	ctx context.Context,
 	params ClaimStartCompensationParams,
@@ -299,6 +321,7 @@ func (r *PostgresRepository) ClaimStartCompensation(
 	}, nil
 }
 
+// CompleteStartCompensation records that owned realtime cleanup was confirmed.
 func (r *PostgresRepository) CompleteStartCompensation(
 	ctx context.Context,
 	params CompleteStartCompensationParams,
@@ -314,6 +337,8 @@ func (r *PostgresRepository) CompleteStartCompensation(
 	)
 }
 
+// FailStartCompensation records that cleanup remains uncertain and must continue
+// blocking any new Start operation.
 func (r *PostgresRepository) FailStartCompensation(
 	ctx context.Context,
 	params FailStartCompensationParams,
@@ -329,6 +354,9 @@ func (r *PostgresRepository) FailStartCompensation(
 	)
 }
 
+// finishStartCompensation fences the terminal write by immutable owner,
+// OperationID, ClaimID, and current operation state. A stale or competing
+// claimant can never mark another owner's cleanup complete or failed.
 func (r *PostgresRepository) finishStartCompensation(
 	ctx context.Context,
 	actorAccountID string,
